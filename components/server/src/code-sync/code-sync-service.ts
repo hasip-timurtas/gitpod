@@ -4,46 +4,49 @@
  * See License-AGPL.txt in the project root for license information.
  */
 
+import { status } from 'grpc';
+import fetch from "node-fetch";
 import { User } from '@gitpod/gitpod-protocol/lib/protocol';
 import bodyParser = require('body-parser');
+import * as util from 'util';
 import * as express from 'express';
 import { inject, injectable } from 'inversify';
 import { BearerAuth } from '../auth/bearer-authenticator';
 import { isWithFunctionAccessGuard } from '../auth/function-access';
+import { CodeSyncResourceDB } from '@gitpod/gitpod-db/lib/typeorm/code-sync-resource-db';
+import { ALL_SERVER_RESOURCES, ServerResource } from '@gitpod/gitpod-db/lib/typeorm/entity/db-code-sync-resource';
+import { BlobServiceClient } from '@gitpod/content-service/lib/blobs_grpc_pb';
+import { DeleteRequest, DownloadUrlRequest, DownloadUrlResponse, UploadUrlRequest, UploadUrlResponse } from '@gitpod/content-service/lib/blobs_pb';
+import { log } from '@gitpod/gitpod-protocol/lib/util/logging';
 
-// should be aligned with https://github.com/gitpod-io/vscode/blob/75c71b49cc25554adc408e63b876b76dcc984bc1/src/vs/platform/userDataSync/common/userDataSync.ts#L113-L156
-export interface IUserData {
-    ref: string;
-    content: string | null;
+// By default: 6 kind of resources * 20 revs * 1Mb = 120Mb max in the content service for user data.
+const defautltRevLimit = 20;
+const defaultContentLimit = '1Mb';
+const codeSyncConfig: Partial<{
+    revLimit: number
+    contentLimit: number
+    resources: {
+        [resource: string]: {
+            revLimit?: number
+        }
+    }
+}> = JSON.parse(process.env.CODE_SYNC_CONFIG || "{}");
+
+const objectPrefix = '/code-sync/';
+function toObjectName(resource: ServerResource, rev: string): string {
+    return objectPrefix + resource + '/' + rev;
 }
 
-export const enum SyncResource {
-    Settings = 'settings',
-    Keybindings = 'keybindings',
-    Snippets = 'snippets',
-    Extensions = 'extensions',
-    GlobalState = 'globalState'
-}
-export const ALL_SYNC_RESOURCES: SyncResource[] = [SyncResource.Settings, SyncResource.Keybindings, SyncResource.Snippets, SyncResource.Extensions, SyncResource.GlobalState];
-
-export interface IUserDataManifest {
-    latest?: Record<ServerResource, string>
-    session: string;
-}
-
-export type ServerResource = SyncResource | 'machines';
-const ALL_SERVER_RESOURCES: ServerResource[] = [...ALL_SYNC_RESOURCES, 'machines'];
-
-interface UserData extends IUserData {
-    created: number
-}
 @injectable()
 export class CodeSyncService {
 
     @inject(BearerAuth)
     private readonly auth: BearerAuth;
 
-    private readonly data = new Map<string, Map<ServerResource, UserData[]>>();
+    @inject(BlobServiceClient)
+    private readonly blobs: BlobServiceClient;
+
+    private readonly db: CodeSyncResourceDB;
 
     get apiRouter(): express.Router {
         const router = express.Router();
@@ -56,118 +59,140 @@ export class CodeSyncService {
             return next();
         });
         router.use(bodyParser.text());
-        router.get('/v1/manifest', (req, res, next) => {
+        router.get('/v1/manifest', async (req, res) => {
             if (!req.isAuthenticated() || !User.is(req.user)) {
                 res.sendStatus(401);
                 return;
             }
-            const session = req.user.id;
-            const data = this.data.get(session);
-            if (!data) {
+            const manifest = await this.db.getManifest(req.user.id);
+            if (!manifest) {
                 res.sendStatus(204);
                 return;
             }
-            const latest: Record<ServerResource, string> = Object.create({});
-            const manifest: IUserDataManifest = { session, latest };
-
-            data.forEach((value, key) => latest[key] = value[value.length - 1].ref);
             res.json(manifest);
             return;
         });
-        router.get('/v1/resource/:resource', (req, res, next) => {
+        router.get('/v1/resource/:resource', async (req, res) => {
             if (!req.isAuthenticated() || !User.is(req.user)) {
                 res.sendStatus(401);
                 return;
             }
-            const session = req.user.id;
-            const resource = req.params.resource;
-            const resourceKey = ALL_SERVER_RESOURCES.find(key => key === resource);
-            const resourceData = resourceKey && this.data.get(session)?.get(resourceKey);
-            if (!resourceData) {
+            const resourceKey = ALL_SERVER_RESOURCES.find(key => key === req.params.resource);
+            const revs = resourceKey && await this.db.getResources(req.user.id, resourceKey)
+            if (!revs || !revs.length) {
                 res.sendStatus(204);
                 return;
             }
-            const result: { url: string, created: number }[] = resourceData.map(e => ({
-                url: req.originalUrl + '/' + e.ref,
-                created: e.created
+            const result: { url: string, created: number }[] = revs.map(e => ({
+                url: req.originalUrl + '/' + e.rev,
+                created: Date.parse(e.created)
             }));
             res.json(result);
             return;
         });
-        router.get('/v1/resource/:resource/:ref', (req, res, next) => {
+        router.get('/v1/resource/:resource/:ref', async (req, res) => {
             if (!req.isAuthenticated() || !User.is(req.user)) {
                 res.sendStatus(401);
                 return;
             }
-            const session = req.user.id;
-            const resource = req.params.resource;
-            const resourceKey = ALL_SERVER_RESOURCES.find(key => key === resource);
+            const resourceKey = ALL_SERVER_RESOURCES.find(key => key === req.params.resource);
             if (!resourceKey) {
                 res.sendStatus(204);
                 return;
             }
-
-            const entries = this.data.get(session)?.get(resourceKey);
-            let resourceData: UserData | undefined;
-            const ref = req.params.ref;
-            if (ref === 'latest') {
-                resourceData = entries?.[entries?.length - 1];
-            } else {
-                resourceData = entries?.find(e => e.ref === ref);
-            }
-            if (!resourceData) {
+            const resource = await this.db.getResource(req.user.id, resourceKey, req.params.ref);
+            if (!resource) {
                 res.setHeader('etag', '0');
                 res.sendStatus(204);
                 return;
             }
-            if (req.headers['If-None-Match'] === resourceData.ref) {
+            if (req.headers['If-None-Match'] === resource.rev) {
                 res.sendStatus(304);
                 return;
             }
-            res.setHeader('etag', resourceData.ref);
-            res.type('text/plain');
-            res.send(resourceData.content || '');
-            return;
+
+            const request = new UploadUrlRequest();
+            request.setOwnerId(req.user.id);
+            request.setName(toObjectName(resourceKey, resource.rev));
+            try {
+                const urlResponse = await util.promisify<DownloadUrlRequest, DownloadUrlResponse>(this.blobs.uploadUrl.bind(this.blobs))(request);
+                const response = await fetch(urlResponse.getUrl());
+                res.setHeader('etag', resource.rev);
+                res.type('text/plain');
+                res.send(response.text());
+            } catch (e) {
+                if (e.code === status.NOT_FOUND) {
+                    res.sendStatus(204);
+                    return;
+                }
+                throw e;
+            }
         });
-        router.post('/v1/resource/:resource', (req, res, next) => {
+        router.post('/v1/resource/:resource', bodyParser.text({
+            limit: codeSyncConfig?.contentLimit || defaultContentLimit
+        }), async (req, res) => {
             if (!req.isAuthenticated() || !User.is(req.user)) {
                 res.sendStatus(401);
                 return;
             }
-            const session = req.user.id;
-            const resource = req.params.resource;
-            const resourceKey = ALL_SERVER_RESOURCES.find(key => key === resource);
+            const resourceKey = ALL_SERVER_RESOURCES.find(key => key === req.params.resource);
             if (!resourceKey) {
                 res.sendStatus(204);
                 return;
             }
-            let data = this.data.get(session);
-            const entries = data?.get(resourceKey) || [];
-            const resourceData = entries[entries.length - 1];
-            if (req.headers['If-Match'] !== undefined && req.headers['If-Match'] !== (resourceData ? resourceData.ref : '0')) {
+            const latestRev = typeof req.headers['If-Match'] === 'string' ? req.headers['If-Match'] : undefined;
+            const revLimit = codeSyncConfig.resources?.[resourceKey]?.revLimit || codeSyncConfig?.revLimit || defautltRevLimit;
+            const userId = req.user.id;
+            let oldObject: string | undefined;
+            const rev = await this.db.insert(userId, resourceKey, async (rev, oldRev) => {
+                const request = new UploadUrlRequest();
+                request.setOwnerId(userId);
+                request.setName(toObjectName(resourceKey, rev));
+                const response = await util.promisify<UploadUrlRequest, UploadUrlResponse>(this.blobs.uploadUrl.bind(this.blobs))(request);
+                const url = response.getUrl();
+                const content = req.body as string;
+                await fetch(url, {
+                    method: 'PUT',
+                    body: content,
+                    headers: {
+                        'content-length': req.headers['content-length'] || String(content.length),
+                        'content-type': req.headers['content-type'] || 'text/plain'
+                    }
+                });
+                oldObject = oldRev && toObjectName(resourceKey, oldRev);
+            }, { latestRev, revLimit });
+            if (oldObject) {
+                const request = new DeleteRequest();
+                request.setExact(oldObject);
+                this.blobs.delete(request, (err: any) => {
+                    if (!err) {
+                        log.error({ userId }, 'code sync: failed to delete', err, { object: oldObject });
+                    }
+                });
+            }
+            if (!rev) {
                 res.sendStatus(412);
                 return;
             }
-            const content = req.body as string;
-            const ref = `${parseInt(resourceData?.ref || '0') + 1}`;
-            entries.push({ ref, content, created: Date.now() / 1000 });
-            if (!data) {
-                data = new Map<ServerResource, UserData[]>();
-                this.data.set(session, data);
-            }
-            data.set(resourceKey, entries);
-            res.setHeader('etag', ref);
+            res.setHeader('etag', rev);
             res.sendStatus(200);
             return;
         });
-        router.delete('/v1/resource', (req, res, next) => {
+        router.delete('/v1/resource', async (req, res) => {
             if (!req.isAuthenticated() || !User.is(req.user)) {
                 res.sendStatus(401);
                 return;
             }
-            const session = req.user.id;
-            this.data.delete(session);
+            const userId = req.user.id;
+            await this.db.delete(req.user.id);
             res.sendStatus(200);
+            const request = new DeleteRequest();
+            request.setPrefix(objectPrefix);
+            this.blobs.delete(request, (err: any) => {
+                if (!err) {
+                    log.error({ userId }, 'code sync: failed to delete', err);
+                }
+            });
             return;
         });
         return router;
