@@ -1,4 +1,4 @@
-#!/bin/bash -li
+#!/usr/bin/env -S bash --norc --noprofile -li
 # Copyright (c) 2020 Gitpod GmbH. All rights reserved.
 # Licensed under the GNU Affero General Public License (AGPL).
 # See License-AGPL.txt in the project root for license information.
@@ -19,6 +19,14 @@
 #    started from non-interactive shells rely some values that we (and others) tend to place into .bashrc
 #    (exmaples: language servers, other language tools)
 # Reference: https://www.gnu.org/software/bash/manual/html_node/Bash-Startup-Files.html#Bash-Startup-Files
+
+# We execute bash with --norc --noprofile. This ignores .bashrc, .bash_profile, etc. Without having these flags,
+# the IDE would not come up when there is a bug in the .bashrc (e.g. introduced by a user; like exit 1).
+# We cannot just change the shebang line to this: #!/bin/bash --norc --noprofile -li
+# because the Linux kernel treats everything following the first word in the shebang line as a single argument.
+# The '#!/usr/bin/env -S' workaround works with coreutils >= 8.30. This is available in Debian 10 and later,
+# RHEL 8 and later, Ubuntu 19.04 and later, etc.
+# see https://unix.stackexchange.com/a/477651/385206 and https://unix.stackexchange.com/a/399698/385206
 
 export SHELL=/bin/bash
 export USER=gitpod
